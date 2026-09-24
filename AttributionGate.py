@@ -7,6 +7,7 @@ import json
 
 AUTHOR_COMMITMENT = "AUTHOR_COMMITMENT"
 NOT_AUTHOR_COMMITMENT = "NOT_AUTHOR_COMMITMENT"
+ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
 VERDICT_NONE = 0
 VERDICT_AUTHOR = 1
@@ -77,12 +78,14 @@ or
 @dataclass
 class RegisterRecord:
     creator: Address
+    beneficiary: Address
     name: str
     author_role_label: str
     required_commitments: u256
     owned_count: u256
     recorded_count: u256
     frozen: bool
+    acknowledged: bool
 
 
 @allow_storage
@@ -114,13 +117,17 @@ class AttributionGate(gl.Contract):
         freeze_register() succeeds only when:
             owned_count >= required_commitments
 
+        acknowledge_register() succeeds only when:
+            the register is FROZEN and the caller is its beneficiary
+
     Honest scope:
     - This contract does not verify that the transaction sender really is the
       declared real-world author role.
     - It does not evaluate legal enforceability, promise strength, testability,
       performance, or external facts.
-    - FROZEN means only that this contract recorded enough statements classified
-      as the declared author's own commitments.
+    - FROZEN means this contract recorded enough statements classified as the
+      declared author's own commitments; only the stored beneficiary may then
+      acknowledge that frozen register.
     - No global admin, deployer privilege, clock, token, or external web source.
     """
 
@@ -130,6 +137,21 @@ class AttributionGate(gl.Contract):
     MAX_STATEMENTS_PER_REGISTER = 20
     MAX_REQUIRED_COMMITMENTS = 10
     MAX_PAGE_SIZE = 50
+    ATTEMPTS_PER_REQUIRED_COMMITMENT = 2
+
+    RESERVED_TOKENS = (
+        "<UNTRUSTED_STATEMENT>",
+        "</UNTRUSTED_STATEMENT>",
+        "<UNTRUSTED_AUTHOR_ROLE>",
+        "</UNTRUSTED_AUTHOR_ROLE>",
+        AUTHOR_COMMITMENT,
+        NOT_AUTHOR_COMMITMENT,
+        "ONLY QUESTION",
+        "DECISION RULES",
+        "DO NOT EVALUATE",
+        "SECURITY RULE",
+        "VERDICT",
+    )
 
     registers: TreeMap[str, RegisterRecord]
     statements: TreeMap[str, StatementRecord]
@@ -148,14 +170,11 @@ class AttributionGate(gl.Contract):
     def _contains_reserved_token(self, value: str) -> bool:
         upper = value.upper()
 
-        return (
-            "<UNTRUSTED_STATEMENT>" in upper
-            or "</UNTRUSTED_STATEMENT>" in upper
-            or "<UNTRUSTED_AUTHOR_ROLE>" in upper
-            or "</UNTRUSTED_AUTHOR_ROLE>" in upper
-            or AUTHOR_COMMITMENT in upper
-            or NOT_AUTHOR_COMMITMENT in upper
-        )
+        for token in self.RESERVED_TOKENS:
+            if token.upper() in upper:
+                return True
+
+        return False
 
     def _clean_name(self, name: str) -> str:
         cleaned = name.strip()
@@ -194,7 +213,9 @@ class AttributionGate(gl.Contract):
         return cleaned
 
     def _clean_statement(self, text: str) -> str:
-        cleaned = text.strip()
+        # Collapse whitespace so cosmetic variants map to the same statement
+        # id instead of consuming another semantic attempt.
+        cleaned = " ".join(text.split())
 
         if len(cleaned) == 0:
             raise gl.vm.UserError("Statement text cannot be empty")
@@ -208,6 +229,17 @@ class AttributionGate(gl.Contract):
             )
 
         return cleaned
+
+    def _statement_limit_for(self, required_commitments: int) -> int:
+        dynamic_limit = (
+            required_commitments
+            * self.ATTEMPTS_PER_REQUIRED_COMMITMENT
+        )
+
+        if dynamic_limit < self.MAX_STATEMENTS_PER_REGISTER:
+            return dynamic_limit
+
+        return self.MAX_STATEMENTS_PER_REGISTER
 
     def _normalize_id(self, value: str, label: str) -> str:
         cleaned = value.strip().lower()
@@ -282,6 +314,9 @@ class AttributionGate(gl.Contract):
         return "NONE"
 
     def _register_state(self, register: RegisterRecord) -> str:
+        if register.acknowledged:
+            return "ACKNOWLEDGED"
+
         if register.frozen:
             return "FROZEN"
 
@@ -333,21 +368,22 @@ SUBMITTED STATEMENT
                 try:
                     data = json.loads(text)
                 except Exception:
-                    data = None
+                    raise gl.vm.UserError("Invalid semantic output")
 
-            # Conservative malformed direction:
-            # malformed output never increments owned_count.
             if not isinstance(data, dict):
-                return {"verdict": NOT_AUTHOR_COMMITMENT}
+                raise gl.vm.UserError("Invalid semantic output")
 
             verdict = str(
                 data.get("verdict", "")
             ).strip().upper()
 
-            if verdict == AUTHOR_COMMITMENT:
-                return {"verdict": AUTHOR_COMMITMENT}
+            if verdict not in (
+                AUTHOR_COMMITMENT,
+                NOT_AUTHOR_COMMITMENT,
+            ):
+                raise gl.vm.UserError("Invalid semantic output")
 
-            return {"verdict": NOT_AUTHOR_COMMITMENT}
+            return {"verdict": verdict}
 
         def validator_fn(leader_result) -> bool:
             if not isinstance(leader_result, gl.vm.Return):
@@ -391,7 +427,7 @@ SUBMITTED STATEMENT
         )
 
         if not isinstance(result, dict):
-            raise gl.vm.UserError("Invalid consensus result")
+            raise gl.vm.UserError("Invalid semantic output")
 
         verdict = str(
             result.get("verdict", "")
@@ -401,7 +437,7 @@ SUBMITTED STATEMENT
             AUTHOR_COMMITMENT,
             NOT_AUTHOR_COMMITMENT,
         ):
-            raise gl.vm.UserError("Invalid consensus verdict")
+            raise gl.vm.UserError("Invalid semantic output")
 
         return verdict
 
@@ -414,6 +450,7 @@ SUBMITTED STATEMENT
         self,
         name: str,
         author_role_label: str,
+        beneficiary_address: str,
         required_commitments: int,
     ) -> None:
         clean_name = self._clean_name(name)
@@ -428,6 +465,20 @@ SUBMITTED STATEMENT
             )
 
         creator = gl.message.sender_address
+
+        try:
+            beneficiary = Address(beneficiary_address)
+        except Exception:
+            raise gl.vm.UserError("Invalid beneficiary address")
+
+        if str(beneficiary).lower() == ZERO_ADDRESS:
+            raise gl.vm.UserError("Beneficiary cannot be the zero address")
+
+        if beneficiary == creator:
+            raise gl.vm.UserError(
+                "Beneficiary must be different from register creator"
+            )
+
         register_id = self._register_id_for(
             creator,
             clean_name,
@@ -438,12 +489,14 @@ SUBMITTED STATEMENT
 
         self.registers[register_id] = RegisterRecord(
             creator=creator,
+            beneficiary=beneficiary,
             name=clean_name,
             author_role_label=clean_role,
             required_commitments=u256(required_commitments),
             owned_count=u256(0),
             recorded_count=u256(0),
             frozen=False,
+            acknowledged=False,
         )
 
     # ============================================================
@@ -467,7 +520,11 @@ SUBMITTED STATEMENT
         if register.frozen:
             raise gl.vm.UserError("Register is frozen")
 
-        if int(register.recorded_count) >= self.MAX_STATEMENTS_PER_REGISTER:
+        statement_limit = self._statement_limit_for(
+            int(register.required_commitments)
+        )
+
+        if int(register.recorded_count) >= statement_limit:
             raise gl.vm.UserError("Register statement limit reached")
 
         clean_text = self._clean_statement(text)
@@ -547,6 +604,34 @@ SUBMITTED STATEMENT
         self.registers[register_id] = register
 
     # ============================================================
+    # WRITE 4 — BENEFICIARY ACKNOWLEDGEMENT (DETERMINISTIC)
+    # ============================================================
+
+    @gl.public.write
+    def acknowledge_register(
+        self,
+        register_id_hex: str,
+    ) -> None:
+        register_id = self._require_register(register_id_hex)
+        register = self.registers[register_id]
+
+        if gl.message.sender_address != register.beneficiary:
+            raise gl.vm.UserError(
+                "Only register beneficiary may acknowledge the register"
+            )
+
+        if not register.frozen:
+            raise gl.vm.UserError(
+                "Only a frozen register may be acknowledged"
+            )
+
+        if register.acknowledged:
+            raise gl.vm.UserError("Register is already acknowledged")
+
+        register.acknowledged = True
+        self.registers[register_id] = register
+
+    # ============================================================
     # VIEWS
     # ============================================================
 
@@ -558,12 +643,17 @@ SUBMITTED STATEMENT
         return {
             "register_id": register_id,
             "creator": str(register.creator),
+            "beneficiary": str(register.beneficiary),
             "name": register.name,
             "author_role_label": register.author_role_label,
             "required_commitments": int(register.required_commitments),
             "owned_count": int(register.owned_count),
             "recorded_count": int(register.recorded_count),
+            "statement_limit": self._statement_limit_for(
+                int(register.required_commitments)
+            ),
             "frozen": register.frozen,
+            "acknowledged": register.acknowledged,
             "state": self._register_state(register),
         }
 
@@ -638,7 +728,7 @@ SUBMITTED STATEMENT
         return {
             "project_name": "OwnThePromise",
             "contract_name": "AttributionGate",
-            "version": "1.0",
+            "version": "1.1",
             "semantic_verdicts": [
                 AUTHOR_COMMITMENT,
                 NOT_AUTHOR_COMMITMENT,
@@ -647,17 +737,22 @@ SUBMITTED STATEMENT
                 "OPEN",
                 "QUOTA_MET",
                 "FROZEN",
+                "ACKNOWLEDGED",
             ],
             "max_name_length": self.MAX_NAME_LENGTH,
             "max_role_label_length": self.MAX_ROLE_LABEL_LENGTH,
             "max_statement_length": self.MAX_STATEMENT_LENGTH,
             "max_statements_per_register": self.MAX_STATEMENTS_PER_REGISTER,
             "max_required_commitments": self.MAX_REQUIRED_COMMITMENTS,
+            "attempts_per_required_commitment": (
+                self.ATTEMPTS_PER_REQUIRED_COMMITMENT
+            ),
             "max_page_size": self.MAX_PAGE_SIZE,
             "global_admin": False,
             "clock_used": False,
             "external_web_used": False,
             "wallet_role_verified": False,
+            "beneficiary_acknowledgement_required": True,
             "statement_id_helper_exposed": False,
             "rubric_hash": self._hash_text(RUBRIC),
         }
